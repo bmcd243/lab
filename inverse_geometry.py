@@ -38,9 +38,14 @@ def computeqgrasppose(robot, qcurrent, cube, cubetarget, viz=None):
         JL = pin.computeFrameJacobian(robot.model, robot.data, q, idL)   # how joints move the LEFT hand
         JR = pin.computeFrameJacobian(robot.model, robot.data, q, idR)   # how joints move the RIGHT hand
 
-        J = np.vstack([JL, JR])  # how joints move both hands
+        # stacked version (both hands equal priority):
+        # J = np.vstack([JL, JR])  # how joints move both hands
+        # vq = pinv(J) @ e  # how to move the joints to move the hands to the hooks
 
-        vq = pinv(J) @ e  # how to move the joints to move the hands to the hooks
+        # null-space version (left hand first, right hand in its null space), as in tutorial 3
+        vqL = pinv(JL) @ eL                          # joint motion that fixes the left hand
+        PL = np.eye(robot.nv) - pinv(JL) @ JL        # joint motions that don't move the left hand
+        vq = vqL + pinv(JR @ PL) @ (eR - JR @ vqL)   # fix the right hand using only those motions
         q += vq  # move the joints
         q = projecttojointlimits(robot, q)  # make sure we don't violate joint limits
 
