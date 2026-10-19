@@ -52,7 +52,7 @@ def lerpplacement(P0, P1, t):
     #   the cube never rotates, so only the translation changes:
     #   position = (1 - t) * P0.translation + t * P1.translation  (same idea as Tutorial 4's lerp)
     #   return pin.SE3(P0.rotation, position)
-    position = P0.translation * (1- t) + P1 * t
+    position = P0.translation * (1- t) + P1.translation * t
     return pin.SE3(P0.rotation, position)
 
     
@@ -79,21 +79,14 @@ def projectedpath(robot, cube, qstart, Pstart, Pend):
 def cubedistance(P1, P2):
     '''Distance between two cube placements (positions only, the cube never rotates).'''
     # TODO 4: norm of the difference of the two translations
-    return np.linalg.norm(P2.translation - P2.translation)
+    return np.linalg.norm(P2.translation - P1.translation)
 
 
 def nearestvertex(G, P):
     '''Index of the node of G whose cube placement is closest to P (as in Tutorial 4).'''
     # TODO 5: same as your Tutorial 4 NEAREST_VERTEX, using cubedistance on node[2]
     #   node layout: G[i] = (parent index, q, cube placement, qs from parent to this node)
-    min_dist = 10e4
-    idx=-1
-    for (i,node) in enumerate(G):
-        dist = cubedistance(node[1],P.translation) 
-        if dist < min_dist:
-            min_dist = dist
-            idx = i
-    return idx
+    
 
 
 def newconf(robot, cube, node, Prand):
