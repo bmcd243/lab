@@ -10,6 +10,7 @@ import pinocchio as pin
 import numpy as np
 from numpy.linalg import pinv, norm
 from inverse_geometry import computeqgrasppose
+from setup_pinocchio import setuppinocchio
 from config import LEFT_HAND, RIGHT_HAND
 import time
 
@@ -73,7 +74,18 @@ def projectedpath(robot, cube, qstart, Pstart, Pend):
     #   - return qs, True
     #   Why: a straight line in q between two grasps does NOT keep the cube grasped
     #   (hands 7.2 cm apart instead of 10 cm halfway between q0 and qe).
-    pass
+    n = max(1, int(np.ceil(cubedistance(Pstart,Pend) / STEP)))
+    q = qstart
+    qs = []
+    Ps = []
+    for i in range(1, n+1):
+        P = lerpplacement(Pstart,Pend, i/n)
+        q, success = computeqgrasppose(robot,q, cube, P)
+        if not success: return qs,Ps, False
+        qs.append(q)
+        Ps.append(P)
+    return qs,Ps, True
+
 
 
 def cubedistance(P1, P2):
@@ -86,7 +98,14 @@ def nearestvertex(G, P):
     '''Index of the node of G whose cube placement is closest to P (as in Tutorial 4).'''
     # TODO 5: same as your Tutorial 4 NEAREST_VERTEX, using cubedistance on node[2]
     #   node layout: G[i] = (parent index, q, cube placement, qs from parent to this node)
-    
+    min_dist = 10e4
+    idx=-1
+    for (i,node) in enumerate(G):
+        dist = cubedistance(node[2],P) 
+        if dist < min_dist:
+            min_dist = dist
+            idx = i
+    return idx
 
 
 def newconf(robot, cube, node, Prand):
@@ -100,7 +119,16 @@ def newconf(robot, cube, node, Prand):
     #   - otherwise the new vertex is the LAST valid q in qs, with the matching placement
     #     (if success is False you need the placement of the last valid step: think about
     #      how to get it, e.g. have projectedpath also return the placements)
-    pass
+    Ptarget = Prand
+    dist = cubedistance(node[2], Prand)
+    if dist > DELTA:
+        Ptarget = lerpplacement(node[2], Prand, DELTA / dist)
+    qs, Ps, success = projectedpath(robot, cube, node[1], node[2], Ptarget)
+    if len(qs) == 0:
+        return None
+    else:
+        return qs[-1], Ps[-1], qs
+    
 
 
 def rrt(robot, cube, qinit, qgoal, Pinit, Pgoal):
@@ -116,31 +144,89 @@ def rrt(robot, cube, qinit, qgoal, Pinit, Pgoal):
     #         if it succeeds, append the goal node and return G, True
     #   return G, False
     #   Optional: every few iterations sample Pgoal itself ("goal bias") to finish faster.
-    pass
+    G = [(None, qinit, Pinit, [])]
+    for _ in range(K):
+        q_rand, P_rand = samplegrasp(robot, cube, G[-1][1])
+        i_near = nearestvertex(G, P_rand)
+        new = newconf(robot,cube, G[i_near], P_rand)
+        if new is None:
+            continue
+        q_new, P_new, qs = new
+        G.append((i_near, q_new, P_new, qs))
+        qs_goal, _, success = projectedpath(robot, cube, q_new, P_new, Pgoal)
+        if success:
+            G.append((len(G)-1, qs_goal[-1], Pgoal, qs_goal))
+            return G, True
+    return G, False
 
 
 def getpath(G):
     '''Return the full list of configurations from the start node to the last node of G.'''
-    # TODO 8: like your Tutorial 4 getpath, but walk back from G[-1] and prepend each
-    #   node's qs (the dense in-between grasps), not just its q. Finish with the start q.
-    pass
+    # Adapted from Tutorial 4's getpath. Each node is (parent index, q, cube placement, qs),
+    # where qs = every grasp configuration from the parent to this node (ending with q).
+    # A straight line in q between two nodes would NOT keep the cube grasped, so the
+    # path must contain all these in-between grasps, not only the nodes.
+    path = []                      # empty to start with
+    node = G[-1]                   # start at the LAST node (the goal) and walk back to the start
+    while node[0] is not None:     # node[0] is the parent index; the start node has None
+        path = node[3] + path      # put this node's in-between grasps (parent -> node) at the FRONT
+        node = G[node[0]]          # jump to the parent node
+    path = [G[0][1]] + path        # the start node has no in-between grasps, so add its q by hand
+    return path
 
 
 #returns a collision free path from qinit to qgoal under grasping constraints
 #the path is expressed as a list of configurations
 def computepath(qinit,qgoal,cubeplacementq0, cubeplacementqgoal):
-    # TODO 9:
-    #   - add robot and cube as extra parameters (allowed by the marking scheme) and update
-    #     the two calls: __main__ below and control.py
-    #   - G, found = rrt(...); if found: return getpath(G)
-    #   - if not found: still return something that runs (e.g. [qinit, qgoal]) and print a warning
-    #   - optional later: shortcut the path (Tutorial 4) using projectedpath for each shortcut
-    return [qinit, qgoal]
+    robot, table, obstacle, cube = setuppinocchio()
+
+    # 1. RRT in cube-placement space
+    G, found = rrt(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal)
+    if not found:
+        print("warning: no path found after", K, "RRT iterations, returning [qinit, qgoal]")
+        return [qinit, qgoal]
+
+    # 2. all grasp configurations from qinit to the goal cube placement
+    path = getpath(G)
+
+    # 3. the RRT reaches the goal cube with a slightly different arm pose than qgoal
+    qlast = path[-1]               
+    nslide = 20
+    for k in range(1, nslide + 1):
+        guess = (1 - k / nslide) * qlast + (k / nslide) * qgoal
+        q, success = computeqgrasppose(robot, guess, cube, cubeplacementqgoal)
+        if not success:
+            print("warning: could not slide onto qgoal, the path ends next to it")
+            return path
+        path.append(q)
+    return path
 
 
 def displaypath(robot,path,dt,viz):
     for q in path:
         viz.display(q)
+        time.sleep(dt)
+
+
+def cubefromhand(robot, cube, q):
+    '''Cube placement held by the robot in configuration q.
+    The left hand sits on the left hook, so: cube = left hand * (cube -> left hook)^-1.'''
+    from config import LEFT_HOOK
+    # cube -> left hook offset, read from the cube model (constant). Do NOT derive it from the
+    # current cube placement: that feeds rounding errors back in and they grow at every call.
+    cMhook = cube.data.oMf[cube.model.getFrameId(LEFT_HOOK)]
+    pin.framesForwardKinematics(robot.model, robot.data, q)
+    oMhand = robot.data.oMf[robot.model.getFrameId(LEFT_HAND)]
+    return oMhand * cMhook.inverse()
+
+
+def displaypathwithcube(robot, cube, path, dt, viz):
+    '''Like displaypath, but the cube moves with the hands.'''
+    from setup_meshcat import updatevisuals
+    from tools import setcubeplacement
+    for q in path:
+        setcubeplacement(robot, cube, cubefromhand(robot, cube, q))
+        updatevisuals(viz, robot, cube, q)
         time.sleep(dt)
 
 
@@ -161,9 +247,4 @@ if __name__ == "__main__":
 
     path = computepath(q0,qe,CUBE_PLACEMENT, CUBE_PLACEMENT_TARGET)
 
-    # TODO 10: check the path before trusting it: for every q, collision(robot, q) is False,
-    #   jointlimitsviolated(robot, q) is False, and both hands are on the hooks.
-    #   Note: viz.display(q) moves the robot but not the cube. To see the cube travel, store the
-    #   placements too and call setcubeplacement + updatevisuals for each step.
-
-    displaypath(robot,path,dt=0.5,viz=viz) #you ll probably want to lower dt
+    displaypathwithcube(robot, cube, path, dt=0.05, viz=viz)
