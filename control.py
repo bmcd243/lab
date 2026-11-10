@@ -10,6 +10,8 @@ import numpy as np
 import pinocchio as pin
 from bezier import Bezier
 from config import DT, LEFT_HAND, RIGHT_HAND, LEFT_HOOK, RIGHT_HOOK
+from math import comb
+import quadprog
 
 # in my solution these gains were good enough for all joints but you might want to tune this.
 Kp = 300.               # proportional gain (P of PD)
@@ -112,6 +114,94 @@ def maketrajpath(path,T):
 
     return q_of_t, vq_of_t, vvq_of_t
 
+# copied from Tutorial 6 (6_convex_optimisation.ipynb, ediadvancedrobotics/tutorials)
+def quadprog_solve_qp(H, q, G=None, h=None, C=None, d=None, verbose=False):
+    """
+    min (1/2)x' P x + q' x
+    subject to  G x <= h
+    subject to  C x  = d
+    """
+    qp_G = 0.5 * (H + H.T)  # make sure P is symmetric
+    qp_a = -q
+    qp_C = None
+    qp_b = None
+    meq = 0
+    if C is not None:
+        if G is not None:
+            qp_C = -np.vstack([C, G]).T
+            qp_b = -np.hstack([d, h])
+        else:
+            qp_C = -C.transpose()
+            qp_b = -d
+        meq = C.shape[0]
+    elif G is not None:  # no equality constraint
+        qp_C = -G.T
+        qp_b = -h
+    res = quadprog.solve_qp(qp_G, qp_a, qp_C, qp_b, meq)
+    if verbose:
+        return res
+    return res[0]
+
+
+
+def weights(t, n):
+    '''One row of A: the n+1 Bezier weights at slider value t (0..1).'''
+    # TODO 1: comb(n, i) * t**i * (1-t)**(n-i) for i = 0..n, as a numpy array
+    return np.array([comb(n, i) * t**i * (1-t)**(n-i) for i in range(n+1)])
+
+
+def maketrajbezier(path, T, robot, n=15):
+    '''Level 1: a single Bezier curve (n+1 control points) fitted to the path with a QP.'''
+    path = np.array(path)                    # shape (number of path points, 15)
+
+    # TODO 2: times of the path points, 0..1, from arc length
+    #         (the same steps / cum / total as in maketrajpath, then cum / total)
+    steps = np.linalg.norm(np.diff(path, axis=0), axis=1)   # length of each piece
+    cum = np.concatenate(([0], np.cumsum(steps)))           # distance from the start to each point
+    total = cum[-1]                                         # length of the whole route
+    times = cum / total                                      # fraction of the route at each point, 0..1
+
+    # TODO 3: build A: one row per path point, row k = weights(time_k, n)
+    rows = [weights(t, n) for t in times]
+    A = np.array(rows)                       # shape (number of path points, n+1
+
+    # TODO 4: C (6 x (n+1)): rows picking out P0, P1, P2, P(n-2), P(n-1), P(n)
+    #         G (2(n+1) x (n+1)): identity on top, minus identity below
+    #         (C and G are the same for every joint, so build them once, here)
+    C = np.zeros((6, n + 1))
+    C[0, 0] = 1  # P0 for joint 0
+    C[1, 1] = 1  # P1 for joint 0
+    C[2, 2] = 1  # P2 for joint 0
+    C[3, n-2] = 1  # P(n-2) for joint 0
+    C[4, n-1] = 1  # P(n-1) for joint 0
+    C[5, n] = 1  # P(n) for joint 0
+    d = np.zeros(6)
+   
+
+
+    X = np.zeros((n + 1, 15))                # the control points, filled one joint at a time
+    for j in range(15):
+        y = path[:, j]                       # this joint's path values
+        d[0] = path[0, j]  # P0 for joint 0
+        d[1] = path[0, j]  # P1 for joint 0
+        d[2] = path[0, j]  # P2 for joint 0
+        d[3] = path[-1, j]  # P(n-2) for joint 0
+        d[4] = path[-1, j]  # P(n-1) for joint 0
+        d[5] = path[-1, j]  # P(n) for joint 0
+        # TODO 5: H, q from A and y
+        #         d: this joint's q0 three times, then its qe three times (path[0, j], path[-1, j])
+        #         h: upper limit (n+1 times), then minus lower limit (n+1 times)
+        #            limits: robot.model.upperPositionLimit[j], robot.model.lowerPositionLimit[j]
+        #         X[:, j] = quadprog_solve_qp(H, q, G, h, C, d)
+        H = A.T @ A
+        q = -A.T @ y
+        G = np.vstack((np.eye(n + 1), -np.eye(n + 1)))
+        h = np.hstack((np.full(n + 1, robot.model.upperPositionLimit[j]), -np.full(n + 1, robot.model.lowerPositionLimit[j])))
+        X[:, j] = quadprog_solve_qp(H, q, G, h, C, d)
+
+    curve = Bezier(list(X), t_max=T)         # list(X) = list of n+1 rows, each 15 numbers
+    return curve, curve.derivative(1), curve.derivative(2)
+
 
 if __name__ == "__main__":
 
@@ -139,7 +229,7 @@ if __name__ == "__main__":
     
 
     total_time = 6.
-    trajs = maketrajpath(path, total_time)
+    trajs = maketrajbezier(path, total_time, robot, n=15)  # level 1: a single Bezier curve fitted to the path with a QP
     tcur = 0.
 
     while tcur < total_time:

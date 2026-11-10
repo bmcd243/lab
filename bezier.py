@@ -7,7 +7,7 @@ class Bezier:
         self.T_min_ = t_min
         self.T_max_ = t_max
         self.mult_T_ = mult_t
-        self.size_ = len(pointlist)- 1
+        self.size_ = len(pointlist)   # bug fix (was len(pointlist) - 1): the degree came out one too low, so the last-but-one control point was ignored and derivative(1) of [p0,p0,p1,p1] was 0
         self.degree_ = self.size_ - 1
         self.control_points_ = pointlist    
         if (self.size_ < 1 or self.T_max_ <= self.T_min_):
