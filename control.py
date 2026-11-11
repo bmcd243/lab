@@ -20,7 +20,35 @@ Ki = 2000.              # integral gain (I of PID): removes the steady offset le
 ie = np.zeros(15)       # running total of the error over time (the e_i of Tutorial 5)
 damping = np.zeros(15)  # joint damping that pybullet applies (read from the simulator in __main__)
 K = 1000
-S = 50
+S = 50                  # fixed squeeze per hand (N), used when FORCE_FEEDBACK is False
+
+# Extension: force feedback on the grip, PI control of the measured contact force
+# (Lecture 11, slide 22).
+FORCE_FEEDBACK = True
+MU = 0.5                # hand-cube friction in pybullet
+SAFETY = 0.6
+F_MIN = 30.
+KF_P, KF_I = 0.5, 30.
+press = friction = press_error_sum = 0.
+
+
+def gripforce(sim):
+    '''Squeeze per hand (N), from the measured contact forces.'''
+    global press, friction, press_error_sum
+
+    press_now = friction_now = 0.
+    for c in sim.p.getContactPoints(sim.robot, sim.cubeId):
+        press_now += c[9]                        # normal force
+        friction_now += np.hypot(c[10], c[12])   # friction force
+    press = 0.8 * press + 0.2 * press_now / 2    # smoothed, per hand
+    friction = 0.8 * friction + 0.2 * friction_now / 2
+
+    target = max(F_MIN, friction / (SAFETY * MU))   # enough press for the friction needed
+    error = target - press
+    press_error_sum += error * DT
+    squeeze = target + KF_P * error + KF_I * press_error_sum
+    return min(max(squeeze, 0.), 150.)
+
 
 def controllaw(sim, robot, trajs, tcurrent, cube):
     global ie                                 # ie must survive from one call to the next
@@ -37,14 +65,15 @@ def controllaw(sim, robot, trajs, tcurrent, cube):
     # where the hands are now
     pin.framesForwardKinematics(robot.model, robot.data, q)
     handL = robot.data.oMf[robot.model.getFrameId(LEFT_HAND)].translation
-    handR = robot.data.oMf[robot.model.getFrameId(RIGHT_HAND)].translation                    # YOU
+    handR = robot.data.oMf[robot.model.getFrameId(RIGHT_HAND)].translation                  
 
     JL = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(LEFT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]  # only the linear part of the Jacobian is needed for the hands
     JR = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(RIGHT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]  # only the linear part of the Jacobian is needed for the hands
 
     inward = (handR - handL) / np.linalg.norm(handR - handL)   # 1-unit-long arrow from the left hand to the right hand
-    FL = K * (hookL - handL) + S * inward     # left hand: spring onto its hook + squeeze towards the right hand
-    FR = K * (hookR - handR) - S * inward     # right hand: the same, squeezing the other way
+    squeeze = gripforce(sim) if FORCE_FEEDBACK else S   # EXTENSION: squeeze from force feedback
+    FL = K * (hookL - handL) + squeeze * inward     # left hand: spring onto its hook + squeeze towards the right hand
+    FR = K * (hookR - handR) - squeeze * inward     # right hand: the same, squeezing the other way
     
     e = q_ref - q
     de = vq_ref - vq
