@@ -1,29 +1,34 @@
 # README – ARO Lab Submission
 
 ## Software requirements
-- Course environment (`aro2026`, Python 3.11) – no additional packages required.
+Course environment only (`aro2026`, Python 3.11); no additional packages required.
 
 ## Algorithms used
 
-### Part 1 – Inverse geometry (`inverse_geometry.py`)
-<!-- ~60 words. Method in computeqgrasppose: solver type, cost terms, joint limits, collision handling. -->
+### Part 1.I – Inverse geometry (`inverse_geometry.py`)
+Iterative inverse kinematics on both hands' 6D placement error. A null-space hierarchy solves the left hand first, then the right hand within its null space. Each step is projected within joint limits. Success requires the hands on the hooks, no collisions and joint limits respected.
 
-The algorithm uses an iterative inverse kinematics solver on the 6D placement error of both hands. At each iteration we compute each hand's error to its hook and use the Jacobian pseudo-inverse to find a joint update that reduces it. We used a null-space hierarchy: the left hand is solved first, then the right hand is solved within the left hand's null space so it doesn't undo that correction. After each step the configuration is projected back within the joint limits. To succeed, the hands must be on the hooks, with no collisions and within the joint limits.
+### Part 1.II – Motion planning (`path.py`)
 
-### Part 2 – Motion planning (`path.py`)
-<!-- ~70 words. rrt + projectedpath + samplegrasp: sampling in cube-placement space,
-     projecting each sample to a grasp config, edge discretisation, wall clearance. -->
+An RRT over cube positions. Each iteration moves the cube up to 10 cm towards a random sample in 1 cm steps, solving IG (Part 1.I) at each step from the previous configuration, then tries a straight line to the target.
 
-On part 2, we used RRT.
+**Extra:** a 1.5 cm wall-clearance margin, so the smoothed Bézier trajectory and tracking error in Part 2 don't cause collisions.
 
-We additionally added a wall-clearance margin to the planner so the path stays clear of obstacles even after Bézier smoothing and tracking error in Part 3.
+### Part 2 – Trajectory & control (`control.py`)
+
+**Trajectory (level 1):** per joint, a degree-15 Bézier curve (control points $P$) fitted by a QP minimising squared distance to the arc-length-timed waypoints, subject to:
+- **equality constraints:** first/last three control points = q₀/q_e, giving zero velocity and acceleration at both ends;
+- **inequality constraints:** $q_{\min} \le P_i \le q_{\max}$ for every control point, so the whole curve stays within the joint limits.
 
 
+**Control:** at each timestep the control law compares the reference with the measured state $(q, \dot q)$ and converts the error into torques using inverse dynamics with PID.
 
 
-### Part 3 – Trajectory & control (`control.py`, `trajectory.py`)
-<!-- ~70 words. Bezier fitting (QP via quadprog / Bernstein least squares), time parametrisation,
-     controllaw: e.g. PD / computed torque + grip force. -->
+#### Extension: force feedback (`gripforce` in `control.py`)
+The squeeze is set from measured hand–cube contact forces (normal $N$, friction $F_t$). The required normal force is
 
-**Extra:**
-<!-- e.g. QP-fitted high-degree Bezier, robustness to other cube targets. -->
+$$
+N^* = \max\left(F_{\min},\ \frac{F_t}{s\,\mu}\right)
+$$
+
+($\mu$: friction coefficient, $s$: safety factor), and a PI loop drives $N$ towards $N^*$, so the hands squeeze harder only when more friction is needed.
