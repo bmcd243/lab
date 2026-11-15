@@ -291,13 +291,13 @@ def displaypathwithcube(robot, cube, path, dt, viz):
 
 
 if __name__ == "__main__":
-    # python path.py         -> plan and check the path (no meshcat needed)
-    # python path.py viz     -> also play it in meshcat (start meshcat-server first)
+    # python path.py         -> plan, check and play the path in meshcat (start meshcat-server first)
+    # python path.py check   -> plan and check only (no meshcat needed)
     # python path.py seeds   -> plan and check with 10 different random seeds
     import sys
     from config import CUBE_PLACEMENT, CUBE_PLACEMENT_TARGET
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    mode = sys.argv[1] if len(sys.argv) > 1 else "viz"
     if mode == "viz":
         from tools import setupwithmeshcat
         robot, cube, viz = setupwithmeshcat()

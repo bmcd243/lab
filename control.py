@@ -222,7 +222,7 @@ def maketrajbezier(path, T, robot, n=15):
         #         h: upper limit (n+1 times), then minus lower limit (n+1 times)
         #            limits: robot.model.upperPositionLimit[j], robot.model.lowerPositionLimit[j]
         #         X[:, j] = quadprog_solve_qp(H, q, G, h, C, d)
-        H = A.T @ A
+        H = A.T @ A + 1e-6 * np.eye(n + 1)   # tiny extra term: H stays invertible even for a 2-point path (no path found)
         q = -A.T @ y
         G = np.vstack((np.eye(n + 1), -np.eye(n + 1)))
         h = np.hstack((np.full(n + 1, robot.model.upperPositionLimit[j]), -np.full(n + 1, robot.model.lowerPositionLimit[j])))
