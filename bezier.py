@@ -7,7 +7,7 @@ class Bezier:
         self.T_min_ = t_min
         self.T_max_ = t_max
         self.mult_T_ = mult_t
-        self.size_ = len(pointlist)- 1
+        self.size_ = len(pointlist)
         self.degree_ = self.size_ - 1
         self.control_points_ = pointlist    
         if (self.size_ < 1 or self.T_max_ <= self.T_min_):
@@ -40,7 +40,7 @@ class Bezier:
             derived_wp.append(self.degree_ * (point2 - point1))
 
         if not derived_wp:
-            derived_wp.append([0] * self.dim_)
+            derived_wp.append(np.zeros(self.dim_))
 
         deriv = Bezier(derived_wp, self.T_min_, self.T_max_, self.mult_T_ * (1.0 / (self.T_max_ - self.T_min_)))
         return deriv.derivative(order - 1)
