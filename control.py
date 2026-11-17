@@ -14,12 +14,12 @@ from math import comb
 import quadprog
 
 # in my solution these gains were good enough for all joints but you might want to tune this.
-Kp = 300.               # proportional gain (P of PD)
-Kv = 2 * np.sqrt(Kp)   # derivative gain (D of PD)
-Ki = 2000.              # integral gain (I of PID): removes the steady offset left by model errors
-ie = np.zeros(15)       # running total of the error over time (the e_i of Tutorial 5)
-damping = np.zeros(15)  # joint damping that pybullet applies (read from the simulator in __main__)
-K = 1000
+Kp = 300.
+Kv = 2 * np.sqrt(Kp)
+Ki = 2000.              # integral term removes the steady offset left by model errors
+ie = np.zeros(15)       # integral of the joint error
+damping = np.zeros(15)  # pybullet joint damping, read from the simulator in __main__
+K = 1000                # spring pulling each hand onto its hook (N/m)
 S = 50                  # fixed squeeze per hand (N), used when FORCE_FEEDBACK is False
 
 # Extension: force feedback on the grip, PI control of the measured contact force
@@ -51,65 +51,67 @@ def gripforce(sim):
 
 
 def controllaw(sim, robot, trajs, tcurrent, cube):
-    global ie                                 # ie must survive from one call to the next
+    global ie
     q, vq = sim.getpybulletstate()
     q_ref = trajs[0](tcurrent)
     vq_ref = trajs[1](tcurrent)
     vvq_ref = trajs[2](tcurrent)
 
+    # hooks: cube pose from pybullet times the hook offsets in the cube model
     pos, quat = sim.p.getBasePositionAndOrientation(sim.cubeId)
     oMcube = pin.XYZQUATToSE3(np.concatenate([pos, quat]))
     hookL = (oMcube * cube.data.oMf[cube.model.getFrameId(LEFT_HOOK)]).translation
-    hookR = (oMcube * cube.data.oMf[cube.model.getFrameId(RIGHT_HOOK)]).translation                 
+    hookR = (oMcube * cube.data.oMf[cube.model.getFrameId(RIGHT_HOOK)]).translation
 
-    # where the hands are now
     pin.framesForwardKinematics(robot.model, robot.data, q)
     handL = robot.data.oMf[robot.model.getFrameId(LEFT_HAND)].translation
-    handR = robot.data.oMf[robot.model.getFrameId(RIGHT_HAND)].translation                  
+    handR = robot.data.oMf[robot.model.getFrameId(RIGHT_HAND)].translation
 
-    JL = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(LEFT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]  # only the linear part of the Jacobian is needed for the hands
-    JR = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(RIGHT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]  # only the linear part of the Jacobian is needed for the hands
+    # linear part of the hand Jacobians, in world axes
+    JL = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(LEFT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]
+    JR = pin.computeFrameJacobian(robot.model, robot.data, q, robot.model.getFrameId(RIGHT_HAND), pin.LOCAL_WORLD_ALIGNED)[:3,:]
 
-    inward = (handR - handL) / np.linalg.norm(handR - handL)   # 1-unit-long arrow from the left hand to the right hand
-    squeeze = gripforce(sim) if FORCE_FEEDBACK else S   # EXTENSION: squeeze from force feedback
-    FL = K * (hookL - handL) + squeeze * inward     # left hand: spring onto its hook + squeeze towards the right hand
-    FR = K * (hookR - handR) - squeeze * inward     # right hand: the same, squeezing the other way
-    
+    # grasp force: spring onto each hook + squeeze towards the other hand
+    inward = (handR - handL) / np.linalg.norm(handR - handL)
+    squeeze = gripforce(sim) if FORCE_FEEDBACK else S
+    FL = K * (hookL - handL) + squeeze * inward
+    FR = K * (hookR - handR) - squeeze * inward
+
+    # inverse dynamics with PID on the joint error
     e = q_ref - q
     de = vq_ref - vq
-    ie = ie + e * DT                          # add this tick's error to the running total
+    ie = ie + e * DT
     a_des = vvq_ref + Kp * e + Kv * de + Ki * ie
     M = pin.crba(robot.model, robot.data, q)
-    M = np.triu(M) + np.triu(M, 1).T          # rebuild the full symmetric M (older pinocchio fills half)
+    M = np.triu(M) + np.triu(M, 1).T          # older pinocchio fills only the upper half
     nle = pin.nle(robot.model, robot.data, q, vq)
-    torques = M @ a_des + nle + damping * vq + JL.T @ FL + JR.T @ FR # + the joint damping pybullet applies, which pinocchio does not model
+    torques = M @ a_des + nle + damping * vq + JL.T @ FL + JR.T @ FR
 
     sim.step(torques)
 
 
-# time parametrisation of a straight line between two configurations (level 0):
-# smooth start and stop, zero velocity at both ends
+# level 0: straight line in q with a smoothstep time law (zero velocity at both ends)
 def maketraj(q0, q1, T):
-    dq = q1 - q0                  # how far each joint has to travel (15 numbers)
+    dq = q1 - q0
 
-    def q_of_t(t):                # where each joint should be at time t
-        u = t / T                 # fraction of the time that has passed, 0 -> 1
-        s = 3*u**2 - 2*u**3       # the slider: 0 -> 1, gentle start and stop
+    def q_of_t(t):
+        u = t / T
+        s = 3*u**2 - 2*u**3
         return q0 + s * dq
 
-    def vq_of_t(t):               # how fast each joint should be moving
-        u = t / T                       # YOU: slider speed (6u - 6u^2)/T, times dq
+    def vq_of_t(t):
+        u = t / T
         return (6*u - 6*u**2) * dq / T
 
-    def vvq_of_t(t):              # how fast the speed should be changing
-        u = t / T                      # YOU: slider acceleration (6 - 12u)/T^2, times dq
+    def vvq_of_t(t):
+        u = t / T
         return (6 - 12*u) * dq / T**2
 
     return q_of_t, vq_of_t, vvq_of_t
 
 
-# the same idea for a path made of many configurations (level 0 along the planned path):
-# the slider decides how far along the route we are, the route is followed piece by piece
+# level 0 along the planned path: the smoothstep sets the distance travelled,
+# linear interpolation between path points gives the configuration
 def maketrajpath(path,T):
 
     path = np.array(path)
@@ -124,21 +126,21 @@ def maketrajpath(path,T):
         d = s * total
         return np.array([np.interp(d, cum, path[:,i]) for i in range(path.shape[1])])
 
-    def direction(t):             # unit vector (15 numbers): which way the joints move in the piece we are in
+    def direction(t):             # unit direction of the path segment we are on
         u = t / T
-        dist = (3*u**2 - 2*u**3) * total                      # distance along the route, as in q_of_t
-        k = np.searchsorted(cum, dist, side='right') - 1      # number of the piece we are in
-        k = min(max(k, 0), len(steps) - 1)                    # stay between the first and last piece (t = T)
-        return (path[k+1] - path[k]) / max(steps[k], 1e-12)   # end minus start of the piece, divided by its length
+        dist = (3*u**2 - 2*u**3) * total
+        k = np.searchsorted(cum, dist, side='right') - 1
+        k = min(max(k, 0), len(steps) - 1)
+        return (path[k+1] - path[k]) / max(steps[k], 1e-12)
 
-    def vq_of_t(t):               # how fast each joint should be moving
+    def vq_of_t(t):
         u = t / T
-        speed = total * (6*u - 6*u**2) / T                    # speed along the route (distance per second)
+        speed = total * (6*u - 6*u**2) / T
         return speed * direction(t)
 
-    def vvq_of_t(t):              # how fast that speed should be changing (the slider's acceleration only)
+    def vvq_of_t(t):
         u = t / T
-        acc = total * (6 - 12*u) / T**2                       # acceleration along the route
+        acc = total * (6 - 12*u) / T**2
         return acc * direction(t)
 
     return q_of_t, vq_of_t, vvq_of_t
@@ -172,63 +174,49 @@ def quadprog_solve_qp(H, q, G=None, h=None, C=None, d=None, verbose=False):
     return res[0]
 
 
-
 def weights(t, n):
-    '''One row of A: the n+1 Bezier weights at slider value t (0..1).'''
-    # TODO 1: comb(n, i) * t**i * (1-t)**(n-i) for i = 0..n, as a numpy array
+    '''Bezier (Bernstein) weights of the n+1 control points at t in [0, 1].'''
     return np.array([comb(n, i) * t**i * (1-t)**(n-i) for i in range(n+1)])
 
 
 def maketrajbezier(path, T, robot, n=15):
-    '''Level 1: a single Bezier curve (n+1 control points) fitted to the path with a QP.'''
-    path = np.array(path)                    # shape (number of path points, 15)
+    '''Level 1: one Bezier curve (n+1 control points) fitted to the path with a QP.'''
+    path = np.array(path)                    # (number of path points, 15)
 
-    # TODO 2: times of the path points, 0..1, from arc length
-    #         (the same steps / cum / total as in maketrajpath, then cum / total)
-    steps = np.linalg.norm(np.diff(path, axis=0), axis=1)   # length of each piece
-    cum = np.concatenate(([0], np.cumsum(steps)))           # distance from the start to each point
-    total = cum[-1]                                         # length of the whole route
-    times = cum / total                                      # fraction of the route at each point, 0..1
+    # time of each path point in [0, 1], proportional to the distance along the path
+    steps = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    cum = np.concatenate(([0], np.cumsum(steps)))
+    total = cum[-1]
+    times = cum / total
 
-    # TODO 3: build A: one row per path point, row k = weights(time_k, n)
-    rows = [weights(t, n) for t in times]
-    A = np.array(rows)                       # shape (number of path points, n+1
+    # A @ X = curve at every path time (X = control points)
+    A = np.array([weights(t, n) for t in times])
 
-    # TODO 4: C (6 x (n+1)): rows picking out P0, P1, P2, P(n-2), P(n-1), P(n)
-    #         G (2(n+1) x (n+1)): identity on top, minus identity below
-    #         (C and G are the same for every joint, so build them once, here)
+    # first/last three control points = q0/qe: zero velocity and acceleration at both ends
     C = np.zeros((6, n + 1))
-    C[0, 0] = 1  # P0 for joint 0
-    C[1, 1] = 1  # P1 for joint 0
-    C[2, 2] = 1  # P2 for joint 0
-    C[3, n-2] = 1  # P(n-2) for joint 0
-    C[4, n-1] = 1  # P(n-1) for joint 0
-    C[5, n] = 1  # P(n) for joint 0
+    C[0, 0] = 1
+    C[1, 1] = 1
+    C[2, 2] = 1
+    C[3, n-2] = 1
+    C[4, n-1] = 1
+    C[5, n] = 1
     d = np.zeros(6)
-   
 
+    # joint limits on every control point (the curve stays in their convex hull)
+    G = np.vstack((np.eye(n + 1), -np.eye(n + 1)))
 
-    X = np.zeros((n + 1, 15))                # the control points, filled one joint at a time
+    # one QP per joint: min ||A x - y||^2 subject to C x = d, G x <= h
+    X = np.zeros((n + 1, 15))
     for j in range(15):
-        y = path[:, j]                       # this joint's path values
-        d[0] = path[0, j]  # P0 for joint 0
-        d[1] = path[0, j]  # P1 for joint 0
-        d[2] = path[0, j]  # P2 for joint 0
-        d[3] = path[-1, j]  # P(n-2) for joint 0
-        d[4] = path[-1, j]  # P(n-1) for joint 0
-        d[5] = path[-1, j]  # P(n) for joint 0
-        # TODO 5: H, q from A and y
-        #         d: this joint's q0 three times, then its qe three times (path[0, j], path[-1, j])
-        #         h: upper limit (n+1 times), then minus lower limit (n+1 times)
-        #            limits: robot.model.upperPositionLimit[j], robot.model.lowerPositionLimit[j]
-        #         X[:, j] = quadprog_solve_qp(H, q, G, h, C, d)
-        H = A.T @ A + 1e-6 * np.eye(n + 1)   # tiny extra term: H stays invertible even for a 2-point path (no path found)
-        q = -A.T @ y
-        G = np.vstack((np.eye(n + 1), -np.eye(n + 1)))
+        y = path[:, j]
+        d[:3] = path[0, j]
+        d[3:] = path[-1, j]
         h = np.hstack((np.full(n + 1, robot.model.upperPositionLimit[j]), -np.full(n + 1, robot.model.lowerPositionLimit[j])))
+        H = A.T @ A + 1e-6 * np.eye(n + 1)   # small ridge keeps H invertible when the path has only 2 points
+        q = -A.T @ y
         X[:, j] = quadprog_solve_qp(H, q, G, h, C, d)
 
-    curve = Bezier(list(X), t_max=T)         # list(X) = list of n+1 rows, each 15 numbers
+    curve = Bezier(list(X), t_max=T)
     return curve, curve.derivative(1), curve.derivative(2)
 
 
@@ -241,12 +229,14 @@ if __name__ == "__main__":
 
     robot, sim, cube = setupwithpybullet()
 
-    # pybullet gives the two hand-tip links (no mass data in the URDF) a default mass of 1 kg that
-    # the pinocchio model does not have: make them (almost) massless
-    for i in range(sim.p.getNumJoints(sim.robot)):
-        if sim.p.getJointInfo(sim.robot, i)[12].decode() in ("LARM_EFF_Link", "RARM_EFF_Link"):
-            sim.p.changeDynamics(sim.robot, i, mass=1e-6, localInertiaDiagonal=[1e-9] * 3)
-    # pybullet also damps every joint: read those coefficients so the controller can add them back
+    # pybullet gives the hand-tip links (no inertial data in the URDF) a default mass of 1 kg:
+    # add the same 1 kg point mass to the pinocchio model so inverse dynamics compensates it
+    for name in (LEFT_HAND, RIGHT_HAND):
+        frame = robot.model.frames[robot.model.getFrameId(name)]
+        joint = frame.parentJoint if hasattr(frame, "parentJoint") else frame.parent   # pinocchio 3 / 2
+        robot.model.inertias[joint] += frame.placement.act(pin.Inertia(1., np.zeros(3), np.zeros((3, 3))))
+    robot.data = robot.model.createData()
+    # pybullet also damps every joint: the controller adds these torques back
     damping[:] = [sim.p.getJointInfo(sim.robot, i)[6] for i in sim.bulletCtrlJointsInPinOrder]
 
     q0,successinit = computeqgrasppose(robot, robot.q0, cube, CUBE_PLACEMENT, None)
@@ -255,17 +245,16 @@ if __name__ == "__main__":
 
     #setting initial configuration
     sim.setqsim(q0)
-    
 
     total_time = 6.
-    trajs = maketrajbezier(path, total_time, robot, n=15)  # level 1: a single Bezier curve fitted to the path with a QP
+    trajs = maketrajbezier(path, total_time, robot, n=15)
     tcur = 0.
 
     while tcur < total_time:
         rununtil(controllaw, DT, sim, robot, trajs, tcur, cube)
         tcur += DT
 
-    # how close did the hands get to where they were asked to go (the end of the path, qe)?
+    # final hand error with respect to qe
     q, vq = sim.getpybulletstate()
     for name in (LEFT_HAND, RIGHT_HAND):
         frame = robot.model.getFrameId(name)

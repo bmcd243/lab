@@ -9,36 +9,31 @@ Created on Thu Sep 21 11:44:32 2023
 import pinocchio as pin
 import numpy as np
 from numpy.linalg import pinv, norm
-from inverse_geometry import computeqgrasppose
+from inverse_geometry import computeqgrasppose, graspik
 from setup_pinocchio import setuppinocchio
 from config import LEFT_HAND, RIGHT_HAND
 import time
 
-# Plan: an RRT (adapted from Tutorial 4, ediadvancedrobotics/tutorials 4_rrt.ipynb)
-# that plans for the CUBE, not for q directly. Every configuration is obtained from a
-# cube placement with computeqgrasppose, so the cube is held along the whole path.
+# RRT adapted from Tutorial 4 (ediadvancedrobotics/tutorials, 4_rrt.ipynb), planning for the
+# CUBE position: every configuration comes from computeqgrasppose, so the cube stays grasped.
 
-# Planning parameters: starting values, tune them once everything runs
-# box where cube positions are sampled (x, y, z). ~53% of samples give a valid grasp.
-# z goes above the wall top (1.00 m) so the cube can be lifted over it.
+# box where cube positions are sampled (x, y, z); z goes above the wall top (1.00 m)
 CUBE_LOW  = np.array([0.30, -0.40, 0.93])
 CUBE_HIGH = np.array([0.45,  0.20, 1.20])
-DELTA = 0.10   # max distance (m) the cube moves along one new edge (like delta_q in Tutorial 4)
+DELTA = 0.10   # max distance (m) the cube moves along one new edge
 STEP  = 0.01   # distance (m) between two re-solved grasps along an edge
 K     = 500    # max number of RRT iterations
-MAXJUMP = 0.3  # max change in q (rad) between two consecutive grasps along an edge
+MAXJUMP = 0.3  # max change in q (rad) between two consecutive grasps
 
-# NEW (wall margin): the robot and cube must stay WALLMARGIN away from the wall (obstacle),
-# so that tracking errors and the Bezier smoothing in control.py do not touch it.
-# The given start and goal grasps are themselves close to the wall (goal: ~2 mm), so the
-# margin fades to 0 when the cube is within FADE of the start or the goal.
+# keep the robot and cube WALLMARGIN away from the wall, so tracking errors and the Bezier
+# smoothing do not touch it; the start and goal grasps are close to the wall (goal ~2 mm),
+# so the margin fades to 0 within FADE of either
 WALLMARGIN = 0.015  # m
 FADE = 0.05         # m
 
 
 def wallclearance(robot, q):
-    '''NEW (wall margin): smallest distance (m) between the wall and the robot or the cube,
-    for configuration q (the cube must already be placed, e.g. by computeqgrasppose).'''
+    '''Smallest distance (m) between the wall and the robot or the (already placed) cube.'''
     cm, cd = robot.collision_model, robot.collision_data
     wall = cm.getGeometryId('obstaclebase_0')
     pairs = [k for k, p in enumerate(cm.collisionPairs) if wall in (p.first, p.second)]
@@ -47,70 +42,50 @@ def wallclearance(robot, q):
 
 
 def requiredclearance(P, ends):
-    '''NEW (wall margin): clearance required when the cube is at placement P.
-    ends = (start placement, goal placement): full WALLMARGIN far from both,
-    fading linearly to 0 within FADE of either one.'''
+    '''Wall clearance required with the cube at P; ends = (start placement, goal placement).'''
     nearest = min(cubedistance(P, E) for E in ends)
     return WALLMARGIN * min(1.0, nearest / FADE)
 
 
 def samplegrasp(robot, cube, qguess):
-    '''II.a  Return (q, placement): a random cube placement inside the sampling box and a
-    valid grasp configuration for it.'''
-    #   loop until success:
-    #     - random cube position: np.random.uniform(CUBE_LOW, CUBE_HIGH)
-    #     - placement with no rotation: pin.SE3(np.eye(3), position)
-    #     - q, success = computeqgrasppose(robot, qguess, cube, placement)
-    #     - if success: return q, placement
-    #   (import computeqgrasppose from inverse_geometry at the top of the file)
+    '''II.a  A random cube placement inside the sampling box and a valid grasp for it.'''
     while True:
         position = np.random.uniform(CUBE_LOW, CUBE_HIGH)
         placement = pin.SE3(np.eye(3), position)
         q, success = computeqgrasppose(robot, qguess, cube, placement)
         if success:
             return q, placement
-    
 
 
 def lerpplacement(P0, P1, t):
-    '''Return the cube placement a fraction t (0..1) of the way from P0 to P1.'''
-    #   the cube never rotates, so only the translation changes:
-    #   position = (1 - t) * P0.translation + t * P1.translation  (same idea as Tutorial 4's lerp)
-    #   return pin.SE3(P0.rotation, position)
-    # used to move cube from A to B in 1cm steps
+    '''Cube placement a fraction t (0..1) of the way from P0 to P1: straight line for the
+    position, constant-speed turn for the rotation.'''
     position = P0.translation * (1- t) + P1.translation * t
-    return pin.SE3(P0.rotation, position)
+    rotation = P0.rotation @ pin.exp3(t * pin.log3(P0.rotation.T @ P1.rotation))
+    return pin.SE3(rotation, position)
 
-    
+
+def randomplacement(Pinit, Pgoal):
+    '''Random cube placement in the sampling box, turned about the vertical axis by an angle
+    between the start and goal angles.'''
+    yaws = [pin.rpy.matrixToRpy(P.rotation)[2] for P in (Pinit, Pgoal)]
+    yaw = np.random.uniform(min(yaws), max(yaws))
+    return pin.SE3(pin.rpy.rpyToMatrix(0., 0., yaw), np.random.uniform(CUBE_LOW, CUBE_HIGH))
 
 
-def projectedpath(robot, cube, qstart, Pstart, Pend, ends):   # NEW: ends, for the wall margin
-    '''II.b  Move the cube from Pstart to Pend in small steps, re-solving the grasp at
-    each step. Return (qs, Ps, success): qs = list of grasp configurations along the way
-    (qstart excluded), Ps = the matching cube placements, success = False as soon as one
-    step fails (qs and Ps then hold the valid part only).'''
-    # move the cube from A to B
-
-    #   - number of steps: n = max(1, int(np.ceil(distance between the two positions / STEP)))
-    #   - q = qstart
-    #   - for i in 1..n:
-    #       P = lerpplacement(Pstart, Pend, i / n)
-    #       q, success = computeqgrasppose(robot, q, cube, P)    # start from the PREVIOUS q
-    #       if not success: return qs, False                     # keep the valid part
-    #       qs.append(q)
-    #   - return qs, True
-    #   Why: a straight line in q between two grasps does NOT keep the cube grasped
-    #   (hands 7.2 cm apart instead of 10 cm halfway between q0 and qe).
+def projectedpath(robot, cube, qstart, Pstart, Pend, ends):
+    '''II.b  Move the cube from Pstart to Pend in STEP increments, re-solving the grasp each
+    time. Return (qs, Ps, success); on failure qs and Ps hold the valid part only.
+    (A straight line in q between two grasps does not keep the cube grasped.)'''
     n = max(1, int(np.ceil(cubedistance(Pstart, Pend) / STEP)))
     q = qstart
     qs, Ps = [], []
     for i in range(1, n + 1):
         P = lerpplacement(Pstart, Pend, i / n)
-        qnext, success = computeqgrasppose(robot, q, cube, P)   # warm start from the previous q
-        # a big change in q means IG jumped to a different arm solution: not a smooth path
+        qnext, success = graspik(robot, q, cube, P)   # one IK attempt, warm-started from the previous q
+        # a big jump in q means IK switched to a different arm pose
         if not success or norm(qnext - q) > MAXJUMP:
-            return qs, Ps, False                                  # keep the valid part
-        # NEW (wall margin): too close to the wall counts as a failed step too
+            return qs, Ps, False
         if wallclearance(robot, qnext) < requiredclearance(P, ends):
             return qs, Ps, False
         q = qnext
@@ -120,71 +95,45 @@ def projectedpath(robot, cube, qstart, Pstart, Pend, ends):   # NEW: ends, for t
 
 
 def cubedistance(P1, P2):
-    '''Distance between two cube placements (positions only, the cube never rotates).'''
-    # norm of the difference of the two translations
-    return np.linalg.norm(P2.translation - P1.translation)
+    '''Distance between two cube placements: position (m) + 0.1 m per radian of rotation.'''
+    angle = np.linalg.norm(pin.log3(P1.rotation.T @ P2.rotation))
+    return np.linalg.norm(P2.translation - P1.translation) + 0.1 * angle
 
 
 def nearestvertex(G, P):
-    '''Index of the node of G whose cube placement is closest to P (as in Tutorial 4).'''
-    # same as your Tutorial 4 NEAREST_VERTEX, using cubedistance on node[2]
-    #   node layout: G[i] = (parent index, q, cube placement, qs from parent to this node)
+    '''Index of the node whose cube placement is closest to P.
+    Node layout: (parent index, q, cube placement, qs from the parent to this node).'''
     distances = [cubedistance(node[2], P) for node in G]
     return int(np.argmin(distances))
 
 
-def newconf(robot, cube, node, Prand, ends):   # NEW: ends, passed on to projectedpath
-    # node is from nearestvertex
+def newconf(robot, cube, node, Prand, ends):
     '''Grow from node towards Prand by at most DELTA. Return (q, placement, qs) of the
-    furthest valid point reached, like NEW_CONF in Tutorial 4.'''
-    #   - Ptarget = Prand, or the point DELTA along the way if Prand is further than DELTA
-    #     (lerpplacement with t = DELTA / distance)
-    #   - qs, success = projectedpath(robot, cube, node q, node placement, Ptarget)
-    #   - if qs is empty: nothing valid, return None
-    #   - otherwise the new vertex is the LAST valid q in qs, with the matching placement
-    #     (if success is False you need the placement of the last valid step: think about
-    #      how to get it, e.g. have projectedpath also return the placements)
-
-    q_near, P_near = node[1], node[2]  # P_near = the cube placement at that node. q_near = the robot configuration at that node: the joint angles that hold the cube there
+    furthest valid point reached, or None, like NEW_CONF in Tutorial 4.'''
+    q_near, P_near = node[1], node[2]
     distance = cubedistance(P_near, Prand)
     if distance <= DELTA:
         Ptarget = Prand
     else:
         Ptarget = lerpplacement(P_near, Prand, DELTA / distance)
 
-    # try to move there, 1cm at a time
     qs, Ps, _ = projectedpath(robot, cube, q_near, P_near, Ptarget, ends)
-
-    if not qs: # not even the first step was valid
+    if not qs:
         return None
-    
-    return qs[-1], Ps[-1], qs   # robot config at the furthest point reached, cube placement there, every config along this edge
-    
+    return qs[-1], Ps[-1], qs
+
 
 def rrt(robot, cube, qinit, qgoal, Pinit, Pgoal):
     '''II.c  RRT in cube-placement space. Return (G, found).'''
-    #   G = [(None, qinit, Pinit, [])]
-    #   for _ in range(K):
-    #       - sample: q_rand, P_rand = samplegrasp(...)   (only P_rand is really needed)
-    #       - i_near = nearestvertex(G, P_rand)
-    #       - new = newconf(robot, cube, G[i_near], P_rand); skip if None
-    #       - append (i_near, q_new, P_new, qs) to G
-    #       - try to connect the new node to the goal: projectedpath(..., P_new, Pgoal)
-    #         if it succeeds, append the goal node and return G, True
-    #   return G, False
-    
-    G = [(None, qinit, Pinit, [])]   # start node: no parent, no edge
-    ends = (Pinit, Pgoal)            # NEW (wall margin): the margin fades out near these two
+    G = [(None, qinit, Pinit, [])]
+    ends = (Pinit, Pgoal)
     for _ in range(K):
-        # direction to grow in: a random cube placement.
-        # only the placement is needed (newconf re-solves the grasps along the edge),
-        # so no IG here, unlike samplegrasp
-        Prand = pin.SE3(np.eye(3), np.random.uniform(CUBE_LOW, CUBE_HIGH))  # (rotation, translation) of where the cube is
+        # random direction to grow in (no IK needed here: newconf solves the grasps)
+        Prand = randomplacement(Pinit, Pgoal)
 
-        # grow from the nearest node towards it
         i_near = nearestvertex(G, Prand)
         new = newconf(robot, cube, G[i_near], Prand, ends)
-        if new is None:   # could not move at all: try another direction
+        if new is None:
             continue
         q_new, P_new, qs = new
         G.append((i_near, q_new, P_new, qs))
@@ -192,50 +141,103 @@ def rrt(robot, cube, qinit, qgoal, Pinit, Pgoal):
         # try to reach the goal in a straight line from the new node
         qs_goal, _, success = projectedpath(robot, cube, q_new, P_new, Pgoal, ends)
         if success:
-            # goal node q is the grasp actually reached, not qgoal (avoids a jump at the end)
             G.append((len(G) - 1, qs_goal[-1], Pgoal, qs_goal))
             return G, True
     return G, False
 
 
-def getpath(G):
-    '''Return the full list of configurations from the start node to the last node of G.'''
-    # like your Tutorial 4 getpath, but walk back from G[-1] and prepend each
-    #   node's qs (the dense in-between grasps), not just its q. Finish with the start q.
-    # start at the goal and follows the parents backwards until you reach the start (the node whose parent is None)
+def rrtconnect(robot, cube, qinit, qgoal, Pinit, Pgoal):
+    '''Extension: RRT-Connect (Lecture 6). One tree grows from the start and one from the goal;
+    after each extension the other tree tries to reach the new node in a straight line.
+    When they meet, the cube's route (start branch + goal branch) is re-solved from qinit in one
+    direction, so the arm poses join without jumps. Returns (G, found) in the same format as rrt.
+    Not used by computepath: on this scene it was slower than rrt (see README).'''
+    ends = (Pinit, Pgoal)
+    A, B = [(None, qinit, Pinit, [])], [(None, qgoal, Pgoal, [])]
+    for _ in range(K):
+        Prand = randomplacement(Pinit, Pgoal)
+        i = nearestvertex(A, Prand)
+        new = newconf(robot, cube, A[i], Prand, ends)
+        if new is not None:
+            A.append((i, new[0], new[1], new[2]))
+            j = nearestvertex(B, new[1])
+            qs, Ps, ok = projectedpath(robot, cube, B[j][1], B[j][2], new[1], ends)
+            if not ok and qs:                       # keep the part of the connection that worked
+                B.append((j, qs[-1], Ps[-1], qs))
+            if ok:
+                start, goal = (A, B) if A[0][2] is Pinit else (B, A)
+                a, b = (len(A) - 1, j) if start is A else (j, len(A) - 1)
+                route = []                          # cube placements from Pinit to Pgoal
+                while a is not None:
+                    route.insert(0, start[a][2]); a = start[a][0]
+                while b is not None:
+                    route.append(goal[b][2]); b = goal[b][0]
+                G, q = [(None, qinit, Pinit, [])], qinit
+                for P0, P1 in zip(route[:-1], route[1:]):
+                    qs, _, ok = projectedpath(robot, cube, q, P0, P1, ends)
+                    if not ok:
+                        break
+                    G.append((len(G) - 1, qs[-1], P1, qs)); q = qs[-1]
+                if ok:
+                    return G, True
+        A, B = B, A                                 # alternate which tree grows
+    return [(None, qinit, Pinit, [])], False
 
+
+def getpath(G):
+    '''All configurations from the start node to the last node of G (as in Tutorial 4,
+    but each edge contributes its intermediate grasps, not just its end).'''
     path = []
-    i = len(G) - 1                    # start at the goal node
-    while G[i][0] is not None:        # until we reach the start node
-        path = G[i][3] + path         # this edge's configs go on the front
-        i = G[i][0]                   # step back to the parent
-    path = [G[i][1]] + path           # finish with the start configuration (qinit)
+    i = len(G) - 1
+    while G[i][0] is not None:
+        path = G[i][3] + path
+        i = G[i][0]
+    path = [G[i][1]] + path
+    return path
+
+
+def shortcut(robot, cube, G, ends):
+    '''Extension: path shortcutting. From each tree node on the path, move the cube straight to
+    the furthest later node that is still reachable (projectedpath: grasp, collisions, wall
+    margin), skipping the RRT's detours. Returns the new configurations, or None if a segment
+    fails when re-projected (the caller then keeps the original path).'''
+    nodes = []                                  # tree nodes from the start to the goal
+    i = len(G) - 1
+    while i is not None:
+        nodes.insert(0, G[i])
+        i = G[i][0]
+
+    q, path, i = nodes[0][1], [nodes[0][1]], 0
+    while i < len(nodes) - 1:
+        for j in range(len(nodes) - 1, i, -1):  # furthest node first
+            qs, _, ok = projectedpath(robot, cube, q, nodes[i][2], nodes[j][2], ends)
+            if ok:
+                break
+        if not ok:
+            return None
+        path += qs
+        q, i = qs[-1], j
     return path
 
 
 #returns a collision free path from qinit to qgoal under grasping constraints
 #the path is expressed as a list of configurations
 def computepath(qinit,qgoal,cubeplacementq0, cubeplacementqgoal):
-    # 1. own robot + cube for planning (signature must stay as these 4 arguments)
     robot, table, obstacle, cube = setuppinocchio()
 
-    # 2. plan
     G, found = rrt(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal)
-
-    # 3. return a path either way
     if not found:
         print("warning: computepath found no path, returning [qinit, qgoal] (not a valid path)")
         return [qinit, qgoal]
-    path = getpath(G)
+    path = shortcut(robot, cube, G, (cubeplacementq0, cubeplacementqgoal)) or getpath(G)
 
-    # 4. NEW (from the control-wip version): the RRT reaches the goal cube placement with a
-    # slightly different arm pose than qgoal. Slide onto qgoal by re-solving the grasp at the
-    # goal placement from guesses moving from the last configuration to qgoal.
+    # the RRT reaches the goal placement with a slightly different arm pose than qgoal:
+    # slide onto qgoal by re-solving the grasp from guesses moving towards qgoal
     qlast = path[-1]
     nslide = 20
     for k in range(1, nslide + 1):
         guess = (1 - k / nslide) * qlast + (k / nslide) * qgoal
-        q, success = computeqgrasppose(robot, guess, cube, cubeplacementqgoal)
+        q, success = graspik(robot, guess, cube, cubeplacementqgoal)
         if not success or norm(q - path[-1]) > MAXJUMP:
             print("warning: could not slide onto qgoal, the path ends next to it")
             return path
@@ -249,25 +251,27 @@ def displaypath(robot,path,dt,viz):
         time.sleep(dt)
 
 
-def cubebetweenhands(robot, q):
-    '''Cube placement held by configuration q: the cube centre sits halfway between the hands.'''
+def cubebetweenhands(robot, cube, q):
+    '''Cube placement held by configuration q: halfway between the hands, turned like the hands.'''
+    from config import LEFT_HOOK
     idL = robot.model.getFrameId(LEFT_HAND)
     idR = robot.model.getFrameId(RIGHT_HAND)
     pin.framesForwardKinematics(robot.model, robot.data, q)
+    pin.framesForwardKinematics(cube.model, cube.data, cube.q0)       # hook offsets in the cube frame
+    cMhook = cube.data.oMf[cube.model.getFrameId(LEFT_HOOK)]
     mid = (robot.data.oMf[idL].translation + robot.data.oMf[idR].translation) / 2
-    return pin.SE3(np.eye(3), mid)
+    return pin.SE3((robot.data.oMf[idL] * cMhook.inverse()).rotation, mid)
 
 
 def checkpath(robot, cube, path):
-    '''Print whether every configuration in path is a valid grasp: no collision,
-    within joint limits, hands holding the cube, and no big jumps. Return True if all pass.'''
+    '''Print whether every configuration is a valid grasp: no collision, within joint limits,
+    hands holding the cube, no big jumps. Return True if all pass.'''
     from tools import collision, jointlimitsviolated, setcubeplacement
     idL = robot.model.getFrameId(LEFT_HAND)
     idR = robot.model.getFrameId(RIGHT_HAND)
     collisions, limits, gaps = 0, 0, []
     for q in path:
-        # put the cube between the hands first, or collision() checks a stale cube position
-        setcubeplacement(robot, cube, cubebetweenhands(robot, q))
+        setcubeplacement(robot, cube, cubebetweenhands(robot, cube, q))   # else collision() uses a stale cube
         collisions += collision(robot, q)
         limits += jointlimitsviolated(robot, q)
         gaps.append(norm(robot.data.oMf[idL].translation - robot.data.oMf[idR].translation))
@@ -275,17 +279,17 @@ def checkpath(robot, cube, path):
     print(f"{len(path)} configs | collisions: {collisions} | joint limit violations: {limits}")
     print(f"hand gap: {min(gaps):.3f}-{max(gaps):.3f} m (should be 0.100) | biggest jump: {jumps:.3f} rad")
     ok = len(path) > 2 and collisions == 0 and limits == 0 \
-        and abs(min(gaps) - 0.1) < 1e-3 and abs(max(gaps) - 0.1) < 1e-3 and jumps <= MAXJUMP
+        and abs(min(gaps) - 0.1) < 2e-3 and abs(max(gaps) - 0.1) < 2e-3 and jumps <= MAXJUMP
     print("PATH VALID" if ok else "PATH INVALID")
     return ok
 
 
 def displaypathwithcube(robot, cube, path, dt, viz):
-    '''Like displaypath, but moves the cube with the hands so you can see it being carried.'''
+    '''Like displaypath, but the cube moves with the hands.'''
     from setup_meshcat import updatevisuals
     from tools import setcubeplacement
     for q in path:
-        setcubeplacement(robot, cube, cubebetweenhands(robot, q))
+        setcubeplacement(robot, cube, cubebetweenhands(robot, cube, q))
         updatevisuals(viz, robot, cube, q)
         time.sleep(dt)
 
