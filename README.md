@@ -21,7 +21,9 @@ Each fixes a problem we measured (10 seeds unless stated).
 1. **Wall clearance** (`requiredclearance`). RRT paths passed 0.1-4.6 mm from the wall and the arm touched it in 4/10 runs. Steps now keep 15 mm, fading to 0 near the start and goal because the goal grasp is 2 mm from the wall. Result: 10/10 delivered, no contact.
 2. **Path shortcutting** (`shortcut`). RRT paths wander and the Bezier fit cuts their corners. Jumping to the furthest reachable node gives 18% shorter paths and a closer fit (largest miss 0.18 -> 0.12 rad). It needs the wall clearance (without it 2/10 touched).
 3. **Cube rotation** (`lerpplacement`, `randomplacement`). The planner kept the start orientation: a rotated goal was reached 17 degrees off, a rotated start found no path. Placements now interpolate yaw and samples draw a yaw between start and goal: six combinations (up to 0.5 rad) give 10/10 valid paths and the cube arrives with 0 degrees error.
-4. **Force feedback** (`gripforce`, Lecture 11). With a fixed squeeze, friction reached its limit during the lift. A PI loop on the measured contact forces keeps it at 60% of the limit. In a test with the cube three times heavier, the fixed squeeze let it slip out of the hands, while the feedback loop held it all the way to the target.
+4. **Force feedback** (`gripforce`, Lecture 11). With a fixed squeeze, friction reached its limit during the lift. A PI loop on the measured contact forces aims to keep it at 60% of the limit. In a test with a 4 kg cube (about 29× the original), the fixed squeeze let it slip out of the hands, while the feedback loop held it all the way to the target.
 5. **RRT-Connect, tried and dropped** (`rrtconnect`, Lecture 6): slower than our RRT (10 s vs 2.4 s mean over 20 seeds, one failure), as our RRT already tries the goal from every node.
 
 **Limits:** only yaw rotations are handled; some rotated goals (e.g. +0.3 rad) have no collision-free grasp.
+
+**Videos:** `main_run.mp4` is `python control.py`. `extensions.mp4` was recorded with `demo.py` (`python demo.py rotation | shortcut | force-fixed | force-feedback`), which uses the same planner and controller.
